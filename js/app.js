@@ -1,6 +1,33 @@
 import * as storage from './storage.js';
 import * as gemini from './gemini.js';
 import * as speech from './speech.js';
+import { initSync } from './sync.js';
+import {
+    FOLDER_NAME,
+    DATA_FILENAME as DRIVE_FILENAME,
+    loadGis,
+    signIn as driveSignIn,
+    signOut as driveSignOut,
+    uploadData,
+    downloadData,
+    getStatus as driveGetStatus,
+    clearDriveRefs
+} from './drivesync.js';
+
+/**
+ * アプリケーションの表示テーマを適用する
+ * @param {string} theme - 'auto', 'light', 'dark' のいずれか
+ */
+function applyTheme(theme) {
+    if (theme === 'light' || theme === 'dark') {
+        document.body.dataset.theme = theme;
+    } else {
+        // 'auto' の場合は属性を削除し、OSのテーマ設定に合わせる
+        delete document.body.dataset.theme;
+    }
+}
+// DOMContentLoaded より前にテーマを適用し、一瞬のチラつきを防ぐ
+applyTheme(storage.getSetting('theme'));
 
 /**
  * DOM要素の参照を保持するオブジェクト
@@ -25,6 +52,51 @@ let generateAbortController = null;
  * @type {number|null}
  */
 let toastTimeoutId = null;
+
+/**
+ * 同期コントローラ
+ * @type {object}
+ */
+const syncController = initSync({
+    getStatus: () => driveGetStatus(),
+    download: () => downloadData(),
+    upload: (payload) => uploadData(payload),
+    onApplied: () => { renderHistory(); refreshCurrentDigest(); },
+    onError: (error, context) => console.error(`同期エラー(${context}):`, error)
+});
+
+/**
+ * 現在表示中のダイジェストが同期によって変更された場合に表示を更新する
+ */
+function refreshCurrentDigest() {
+    if (!currentDigest) {
+        return;
+    }
+
+    // 読み上げ中は中断しない
+    if (speech.isSpeaking()) {
+        return;
+    }
+
+    const updatedDigest = storage.getDigestById(currentDigest.id);
+
+    if (!updatedDigest) {
+        // 他端末で削除された場合
+        els.digestPanel.hidden = true;
+        currentDigest = null;
+        updateMainEmpty();
+        toast('表示中のダイジェストが他端末で削除されました。');
+        return;
+    }
+
+    // 中身が変わっているかチェック (簡易的にテキストと文字数で)
+    if (updatedDigest.text !== currentDigest.text || updatedDigest.charCount !== currentDigest.charCount) {
+        currentDigest = updatedDigest; // 更新されたダイジェストに差し替え
+        showDigest(currentDigest); // UIを再描画
+        toast('表示中のダイジェストが他端末で更新されました。');
+    }
+    // 変わっていなければ何もしない
+}
 
 /**
  * アプリケーションの初期化
@@ -54,7 +126,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 8. Service Worker を登録
     registerServiceWorker();
 
-    // イベントリスナーの設定
+    // 9. Googleドライブ同期の初期化
+    updateDriveStatus(); // まずは現在の状態を表示
+
+    const googleClientId = storage.getSetting('googleClientId');
+    if (googleClientId) {
+        els.googleClientId.placeholder = '保存済み（変更する場合のみ入力）';
+        // GISの読み込みと無音サインインはawaitでブロックしない
+        loadGis().then(() => {
+            return driveSignIn(googleClientId, false); // silent = true ではないが、UIは出さない
+        }).then(isSignedIn => {
+            if (isSignedIn) {
+                console.log('Googleドライブに無音サインインしました。');
+                syncController.start(); // 同期コントローラを起動
+                updateDriveStatus(); // ログイン状態を更新
+                syncNow(true); // 初回同期を静かに実行
+            } else {
+                console.warn('Googleドライブへの無音サインインに失敗しました。');
+                updateDriveStatus(); // 失敗状態を更新
+            }
+        }).catch(error => {
+            console.error('Googleドライブ初期化エラー:', error);
+            updateDriveStatus(); // エラー状態を更新
+        });
+    }
+
+    // 10. イベントリスナーの設定
     setupEventListeners();
 });
 
@@ -72,6 +169,7 @@ function collectDomElements() {
     els.generateStatusSpinner = els.generateStatus.querySelector('.spinner');
     els.generateStatusText = els.generateStatus.querySelector('.message-text');
     els.btnCancelGenerate = document.getElementById('btn-cancel-generate');
+    els.mainEmpty = document.getElementById('main-empty'); // 新規
 
     els.digestPanel = document.getElementById('digest-panel');
     els.digestMeta = document.getElementById('digest-meta');
@@ -79,7 +177,12 @@ function collectDomElements() {
     els.btnPause = document.getElementById('btn-pause');
     els.btnStop = document.getElementById('btn-stop');
     els.speakProgress = document.getElementById('speak-progress');
+    els.speakEqualizer = document.getElementById('speak-equalizer'); // 新規
     els.digestText = document.getElementById('digest-text');
+
+    els.recentRail = document.getElementById('recent-rail'); // 新規
+    els.recentRailList = document.getElementById('recent-rail-list'); // 新規
+    els.recentRailEmpty = document.getElementById('recent-rail-empty'); // 新規
 
     els.historyEmpty = document.getElementById('history-empty');
     els.historyList = document.getElementById('history-list');
@@ -94,12 +197,23 @@ function collectDomElements() {
     els.voiceSelect = document.getElementById('voice-select');
     els.rateRange = document.getElementById('rate-range');
     els.rateValue = document.getElementById('rate-value');
+    els.volumeRange = document.getElementById('volume-range'); // 新規
+    els.volumeValue = document.getElementById('volume-value'); // 新規
     els.btnTestSpeak = document.getElementById('btn-test-speak');
     els.autoPlay = document.getElementById('auto-play');
     els.speechUnsupported = document.getElementById('speech-unsupported');
 
+    els.themeSelect = document.getElementById('theme-select'); // 新規
+
     els.modelSelect = document.getElementById('model-select');
     els.settingsStatus = document.getElementById('settings-status');
+
+    els.googleClientId = document.getElementById('google-client-id'); // 新規
+    els.btnSaveClientId = document.getElementById('btn-save-client-id'); // 新規
+    els.driveStatus = document.getElementById('drive-status'); // 新規
+    els.btnDriveSignin = document.getElementById('btn-drive-signin'); // 新規
+    els.btnSyncNow = document.getElementById('btn-sync-now'); // 新規
+    els.btnDriveSignout = document.getElementById('btn-drive-signout'); // 新規
 
     els.bottomNav = document.querySelector('.bottom-nav');
     els.navButtons = els.bottomNav.querySelectorAll('.nav-btn');
@@ -139,14 +253,25 @@ function setupEventListeners() {
     els.historyList.addEventListener('click', handleHistoryAction);
     els.btnClearHistory.addEventListener('click', handleClearHistory);
 
+    // 最近のダイジェスト（右レール）
+    els.recentRailList.addEventListener('click', handleRecentRailClick);
+
     // 設定
     els.btnSaveKey.addEventListener('click', handleSaveApiKey);
     els.btnClearKey.addEventListener('click', handleClearApiKey);
     els.voiceSelect.addEventListener('change', handleVoiceChange);
     els.rateRange.addEventListener('input', handleRateChange);
+    els.volumeRange.addEventListener('input', handleVolumeChange); // 新規
     els.btnTestSpeak.addEventListener('click', handleTestSpeak);
     els.autoPlay.addEventListener('change', handleAutoPlayChange);
+    els.themeSelect.addEventListener('change', handleThemeChange); // 新規
     els.modelSelect.addEventListener('change', handleModelChange);
+
+    // Googleドライブ同期
+    els.btnSaveClientId.addEventListener('click', handleSaveClientId); // 新規
+    els.btnDriveSignin.addEventListener('click', handleDriveSignIn); // 新規
+    els.btnSyncNow.addEventListener('click', () => syncNow(false)); // 新規
+    els.btnDriveSignout.addEventListener('click', handleDriveSignOut); // 新規
 }
 
 /**
@@ -204,11 +329,27 @@ async function loadAndApplySettings() {
     els.rateRange.value = settings.rate;
     els.rateValue.textContent = settings.rate.toFixed(1);
 
+    // 読み上げ音量
+    els.volumeRange.value = settings.volume; // 新規
+    els.volumeValue.textContent = Math.round(settings.volume * 100) + '%'; // 新規
+
     // 自動再生
     els.autoPlay.checked = settings.autoPlay;
 
+    // 表示テーマ
+    els.themeSelect.value = settings.theme; // 新規
+
     // Geminiモデル
     els.modelSelect.value = settings.model;
+
+    // GoogleクライアントID
+    const googleClientId = settings.googleClientId;
+    if (googleClientId) {
+        els.googleClientId.placeholder = '保存済み（変更する場合のみ入力）';
+    } else {
+        els.googleClientId.placeholder = 'xxxxx.apps.googleusercontent.com';
+    }
+    els.googleClientId.value = ''; // クライアントIDも入力欄に実値を入れない
 }
 
 /**
@@ -221,8 +362,43 @@ function checkSpeechSupport() {
         els.btnTestSpeak.disabled = true;
         els.voiceSelect.disabled = true;
         els.rateRange.disabled = true;
+        els.volumeRange.disabled = true; // 新規
         els.autoPlay.disabled = true;
     }
+}
+
+/**
+ * 音声の表示名を整形する
+ * @param {SpeechSynthesisVoice} voice - 音声オブジェクト
+ * @returns {string} 整形された音声名
+ */
+function formatVoiceName(voice) {
+    let name = voice.name;
+    const langMap = {
+        'ja': '日本語', 'en': '英語', 'zh': '中国語', 'ko': '韓国語', 'fr': 'フランス語',
+        'de': 'ドイツ語', 'es': 'スペイン語', 'it': 'イタリア語', 'pt': 'ポルトガル語', 'ru': 'ロシア語'
+    };
+    const langDisplayName = langMap[voice.lang.split('-')[0]] || voice.lang;
+
+    // ベンダー接頭辞を削除
+    const vendors = ['Microsoft ', 'Google ', 'Apple '];
+    for (const vendor of vendors) {
+        if (name.startsWith(vendor)) {
+            name = name.substring(vendor.length);
+            break;
+        }
+    }
+
+    // 言語表記を削除 (例: " - Japanese (Japan)", "(ja-JP)")
+    name = name.replace(/ - [A-Za-z\s]+\s*(\([A-Za-z-]+\))?$/, '');
+    name = name.replace(/\s*\([a-z]{2}-[A-Z]{2}\)$/, '');
+
+    // 短縮した結果が空になる場合は元の名前を使う
+    if (name.trim() === '') {
+        name = voice.name;
+    }
+
+    return `${name}（${langDisplayName}）`;
 }
 
 /**
@@ -254,7 +430,8 @@ async function populateVoiceSelect() {
     sortedVoices.forEach(voice => {
         const option = document.createElement('option');
         option.value = voice.voiceURI;
-        option.textContent = `${voice.name}（${voice.lang}）`;
+        option.textContent = formatVoiceName(voice); // 整形した名前を使用
+        option.title = `${voice.name}（${voice.lang}）`; // デバッグ用に元の名前とロケールをtitleに
         els.voiceSelect.appendChild(option);
     });
 
@@ -283,6 +460,7 @@ async function loadTodayDigest() {
         currentDigest = latestDigest;
         showDigest(currentDigest);
     }
+    updateMainEmpty(); // メイン画面の空状態を更新
 }
 
 /**
@@ -343,6 +521,15 @@ function handleRateChange() {
 }
 
 /**
+ * 読み上げ音量の変更ハンドラ
+ */
+function handleVolumeChange() {
+    const volume = Number(els.volumeRange.value);
+    els.volumeValue.textContent = Math.round(volume * 100) + '%';
+    storage.setSetting('volume', volume);
+}
+
+/**
  * テスト再生ボタンのハンドラ
  */
 function handleTestSpeak() {
@@ -350,6 +537,7 @@ function handleTestSpeak() {
     speech.speak('これはテスト再生です。この声と速さで読み上げます。', {
         voiceURI: settings.voiceURI,
         rate: settings.rate,
+        volume: settings.volume, // 新規
         onError: (err) => toast(err.message)
     });
 }
@@ -359,6 +547,15 @@ function handleTestSpeak() {
  */
 function handleAutoPlayChange() {
     storage.setSetting('autoPlay', els.autoPlay.checked);
+}
+
+/**
+ * テーマ選択の変更ハンドラ
+ */
+function handleThemeChange() {
+    const theme = els.themeSelect.value;
+    storage.setSetting('theme', theme);
+    applyTheme(theme);
 }
 
 /**
@@ -383,6 +580,7 @@ async function handleGenerateDigest() {
 
     // UIの状態を更新
     els.btnGenerate.disabled = true;
+    els.btnGenerate.classList.add('is-generating'); // シマー開始
     els.btnCancelGenerate.hidden = false;
     els.generateStatus.hidden = false;
     els.generateStatus.className = 'status-message status-loading';
@@ -408,6 +606,7 @@ async function handleGenerateDigest() {
         currentDigest = savedDigest; // 現在のダイジェストを更新
         showDigest(savedDigest);
         renderHistory();
+        autoSync(); // 生成成功後に同期
         toast('ダイジェストを生成しました。');
 
         if (settings.autoPlay) {
@@ -426,6 +625,7 @@ async function handleGenerateDigest() {
         console.error('ダイジェスト生成エラー:', error);
     } finally {
         els.btnGenerate.disabled = false;
+        els.btnGenerate.classList.remove('is-generating'); // シマー終了
         els.btnCancelGenerate.hidden = true;
         generateAbortController = null;
         // AbortError 以外のエラー時はステータス表示を残すため、hidden=true はしない
@@ -445,6 +645,13 @@ function handleCancelGenerate() {
 }
 
 /**
+ * メインビューの空状態表示を更新する
+ */
+function updateMainEmpty() {
+    els.mainEmpty.hidden = !els.digestPanel.hidden;
+}
+
+/**
  * ダイジェストを表示する
  * @param {object} digest - 表示するダイジェストデータ
  */
@@ -457,6 +664,8 @@ function showDigest(digest) {
 
     // 読み上げコントロールを初期状態に戻す
     resetSpeakUI();
+    updateMainEmpty(); // メイン画面の空状態を更新
+    renderRecentRail(); // 現在表示中のダイジェストをハイライトするため
 }
 
 /**
@@ -467,6 +676,7 @@ function startSpeaking(text) {
     const settings = storage.getSettings();
     const voiceURI = settings.voiceURI;
     const rate = settings.rate;
+    const volume = settings.volume; // 新規
 
     // UIの状態を更新
     els.btnSpeak.hidden = true;
@@ -475,10 +685,13 @@ function startSpeaking(text) {
     els.btnPause.dataset.state = 'playing';
     els.btnStop.hidden = false;
     els.speakProgress.hidden = false;
+    els.speakEqualizer.hidden = false; // イコライザー表示
+    els.speakEqualizer.classList.remove('is-paused'); // 一時停止状態を解除
 
     const started = speech.speak(text, {
         voiceURI,
         rate,
+        volume, // 新規
         onChunk: (index, total) => {
             els.speakProgress.textContent = `読み上げ中 ${index + 1} / ${total}`;
         },
@@ -508,10 +721,12 @@ function handlePauseResume() {
         speech.pause();
         els.btnPause.textContent = '再開';
         els.btnPause.dataset.state = 'paused';
+        els.speakEqualizer.classList.add('is-paused'); // イコライザー一時停止
     } else {
         speech.resume();
         els.btnPause.textContent = '一時停止';
         els.btnPause.dataset.state = 'playing';
+        els.speakEqualizer.classList.remove('is-paused'); // イコライザー再開
     }
 }
 
@@ -532,8 +747,41 @@ function resetSpeakUI() {
     els.btnPause.hidden = true;
     els.btnStop.hidden = true;
     els.speakProgress.hidden = true;
+    els.speakEqualizer.hidden = true; // イコライザー非表示
+    els.speakEqualizer.classList.remove('is-paused'); // 一時停止状態を解除
     els.btnPause.textContent = '一時停止';
     els.btnPause.dataset.state = 'playing';
+}
+
+/**
+ * 日付文字列を相対的な表現にフォーマットする
+ * @param {string} dateString - YYYY-MM-DD形式の日付文字列
+ * @param {string} [todayString=storage.getLocalDateString()] - 今日の日付文字列 (YYYY-MM-DD)
+ * @returns {string} 相対的な日付表現 ('今日', '昨日', 'N日前' など)
+ */
+function formatRelativeDate(dateString, todayString = storage.getLocalDateString()) {
+    const parseDate = (dStr) => {
+        const [year, month, day] = dStr.split('-').map(Number);
+        return new Date(year, month - 1, day); // UTC解釈を避けるためローカルタイムで
+    };
+
+    const date = parseDate(dateString);
+    const today = parseDate(todayString);
+
+    const diffTime = today.getTime() - date.getTime();
+    const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24)); // 日数差を計算
+
+    if (diffDays === 0) {
+        return '今日';
+    } else if (diffDays === 1) {
+        return '昨日';
+    } else if (diffDays === 2) {
+        return '一昨日';
+    } else if (diffDays >= 3 && diffDays <= 6) {
+        return `${diffDays}日前`;
+    } else {
+        return dateString; // それ以外は元のYYYY-MM-DD形式
+    }
 }
 
 /**
@@ -546,47 +794,110 @@ function renderHistory() {
         els.historyEmpty.hidden = false;
         els.historyList.replaceChildren(); // 子要素を全てクリア
         els.btnClearHistory.hidden = true;
+    } else {
+        els.historyEmpty.hidden = true;
+        els.btnClearHistory.hidden = false;
+
+        const fragment = document.createDocumentFragment();
+        digests.forEach(d => {
+            const li = document.createElement('li');
+            li.className = 'history-item';
+
+            const dateDiv = document.createElement('div');
+            dateDiv.className = 'history-date';
+            dateDiv.textContent = `${formatRelativeDate(d.date)}（${d.date}・約${d.charCount}文字）`; // 相対日付を適用
+            li.appendChild(dateDiv);
+
+            const previewDiv = document.createElement('div');
+            previewDiv.className = 'history-preview';
+            previewDiv.textContent = d.text.slice(0, 60) + '…';
+            li.appendChild(previewDiv);
+
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'history-actions';
+
+            const openBtn = document.createElement('button');
+            openBtn.className = 'primary-btn btn-open'; // primary-btn に変更
+            openBtn.dataset.id = d.id;
+            openBtn.textContent = '開く';
+            actionsDiv.appendChild(openBtn);
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'ghost-btn btn-delete'; // ghost-btn に変更
+            deleteBtn.dataset.id = d.id;
+            deleteBtn.textContent = '削除';
+            actionsDiv.appendChild(deleteBtn);
+
+            li.appendChild(actionsDiv);
+            fragment.appendChild(li);
+        });
+
+        els.historyList.replaceChildren(fragment);
+    }
+    renderRecentRail(); // 履歴更新時に右レールも更新
+}
+
+/**
+ * 右レール「最近のダイジェスト」を描画する
+ */
+function renderRecentRail() {
+    const digests = storage.loadDigests().slice(0, 5); // 最新5件
+
+    if (digests.length === 0) {
+        els.recentRailEmpty.hidden = false;
+        els.recentRailList.replaceChildren();
         return;
     }
 
-    els.historyEmpty.hidden = true;
-    els.btnClearHistory.hidden = false;
-
+    els.recentRailEmpty.hidden = true;
     const fragment = document.createDocumentFragment();
+
     digests.forEach(d => {
         const li = document.createElement('li');
-        li.className = 'history-item';
+        li.className = 'rail-item';
 
-        const dateDiv = document.createElement('div');
-        dateDiv.className = 'history-date';
-        dateDiv.textContent = `${d.date}（約${d.charCount}文字）`;
-        li.appendChild(dateDiv);
+        const button = document.createElement('button');
+        button.className = 'rail-item-btn';
+        if (currentDigest && currentDigest.id === d.id) {
+            button.classList.add('is-current');
+        }
+        button.dataset.id = d.id;
 
-        const previewDiv = document.createElement('div');
-        previewDiv.className = 'history-preview';
-        previewDiv.textContent = d.text.slice(0, 60) + '…';
-        li.appendChild(previewDiv);
+        const dateSpan = document.createElement('span');
+        dateSpan.className = 'rail-date';
+        dateSpan.textContent = formatRelativeDate(d.date);
+        button.appendChild(dateSpan);
 
-        const actionsDiv = document.createElement('div');
-        actionsDiv.className = 'history-actions';
+        const previewSpan = document.createElement('span');
+        previewSpan.className = 'rail-preview';
+        previewSpan.textContent = d.text.slice(0, 50);
+        button.appendChild(previewSpan);
 
-        const openBtn = document.createElement('button');
-        openBtn.className = 'secondary-btn btn-open';
-        openBtn.dataset.id = d.id;
-        openBtn.textContent = '開く';
-        actionsDiv.appendChild(openBtn);
-
-        const deleteBtn = document.createElement('button');
-        deleteBtn.className = 'danger-btn btn-delete';
-        deleteBtn.dataset.id = d.id;
-        deleteBtn.textContent = '削除';
-        actionsDiv.appendChild(deleteBtn);
-
-        li.appendChild(actionsDiv);
+        li.appendChild(button);
         fragment.appendChild(li);
     });
 
-    els.historyList.replaceChildren(fragment);
+    els.recentRailList.replaceChildren(fragment);
+}
+
+/**
+ * 右レール「最近のダイジェスト」のクリックハンドラ
+ * @param {Event} event - クリックイベント
+ */
+function handleRecentRailClick(event) {
+    const target = event.target.closest('.rail-item-btn');
+    if (target) {
+        const id = target.dataset.id;
+        const digest = storage.getDigestById(id);
+        if (digest) {
+            currentDigest = digest;
+            showDigest(digest);
+            // switchView('main'); // すでにメインビューにいるので不要
+        } else {
+            toast('ダイジェストが見つかりませんでした。');
+            renderHistory(); // 見つからない場合は履歴を再描画して整合性を保つ
+        }
+    }
 }
 
 /**
@@ -619,7 +930,9 @@ function handleHistoryAction(event) {
             if (currentDigest && currentDigest.id === id) {
                 els.digestPanel.hidden = true;
                 currentDigest = null;
+                updateMainEmpty(); // メイン画面の空状態を更新
             }
+            autoSync(); // 削除後に同期
         }
     }
 }
@@ -635,7 +948,154 @@ function handleClearHistory() {
         // メイン画面に表示中のダイジェストもクリア
         els.digestPanel.hidden = true;
         currentDigest = null;
+        updateMainEmpty(); // メイン画面の空状態を更新
+        autoSync(); // 削除後に同期
     }
+}
+
+/**
+ * Googleドライブ同期のUI状態を更新する
+ */
+async function updateDriveStatus() {
+    const status = await driveGetStatus();
+    const googleClientId = storage.getSetting('googleClientId');
+
+    // まず全てのボタンを隠す
+    els.btnDriveSignin.hidden = true;
+    els.btnSyncNow.hidden = true;
+    els.btnDriveSignout.hidden = true;
+    els.driveStatus.className = 'status-message'; // デフォルトのスタイルに戻す
+
+    if (!googleClientId) {
+        els.driveStatus.textContent = '未設定 — GoogleクライアントIDを登録してください';
+        return;
+    }
+
+    if (!status.signedIn) {
+        els.driveStatus.textContent = '未ログイン —「Googleでログイン」を押してください';
+        els.btnDriveSignin.hidden = false;
+        return;
+    }
+
+    let lastSyncedAtText = '未同期';
+    if (status.lastSyncedAt) {
+        const date = new Date(status.lastSyncedAt);
+        lastSyncedAtText = `最終同期: ${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')} ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+    }
+
+    els.driveStatus.textContent = `ログイン中 / ${FOLDER_NAME}/${DRIVE_FILENAME} — ${lastSyncedAtText}`;
+    els.driveStatus.classList.add('status-success');
+    els.btnSyncNow.hidden = false;
+    els.btnDriveSignout.hidden = false;
+}
+
+/**
+ * GoogleクライアントIDを保存するハンドラ
+ */
+async function handleSaveClientId() {
+    const id = els.googleClientId.value.trim();
+    if (!id) {
+        toast('GoogleクライアントIDを入力してください。');
+        return;
+    }
+    if (!id.endsWith('.apps.googleusercontent.com')) {
+        toast('クライアントIDの形式が一般的ではありません（.apps.googleusercontent.comで終わるはずです）。保存はしますが、確認してください。');
+    }
+
+    storage.setSetting('googleClientId', id);
+    els.googleClientId.value = '';
+    els.googleClientId.placeholder = '保存済み（変更する場合のみ入力）';
+    toast('GoogleクライアントIDを保存しました。');
+    await updateDriveStatus();
+}
+
+/**
+ * Googleドライブにサインインするハンドラ
+ */
+async function handleDriveSignIn() {
+    const clientId = storage.getSetting('googleClientId');
+    if (!clientId) {
+        toast('先にGoogleクライアントIDを設定してください。');
+        switchView('settings');
+        return;
+    }
+
+    try {
+        await loadGis(); // GISライブラリをロード
+        const isSignedIn = await driveSignIn(clientId, true); // UIを伴うサインイン
+        if (isSignedIn) {
+            toast('Googleにログインしました。');
+            syncController.start(); // 同期コントローラを起動
+            await syncNow(false); // 初回同期を実行
+        } else {
+            toast('ログインできませんでした。クライアントIDと承認済みJavaScript生成元を確認してください。');
+        }
+    } catch (error) {
+        console.error('Googleドライブサインインエラー:', error);
+        toast(`ログインに失敗しました: ${error.message}`);
+    } finally {
+        await updateDriveStatus();
+    }
+}
+
+/**
+ * Googleドライブからサインアウトするハンドラ
+ */
+async function handleDriveSignOut() {
+    if (confirm('Googleドライブとの連携を解除しますか？（この端末の履歴は消えません）')) {
+        try {
+            syncController.stop(); // 同期コントローラを停止
+            await driveSignOut();
+            toast('ログアウトしました。');
+        } catch (error) {
+            console.error('Googleドライブサインアウトエラー:', error);
+            toast(`ログアウトに失敗しました: ${error.message}`);
+        } finally {
+            await updateDriveStatus();
+            // clearDriveRefs(); // フォルダID/ファイルIDを消すと再ログイン時に探し直しになるため呼ばない
+        }
+    }
+}
+
+/**
+ * Googleドライブと今すぐ同期する
+ * @param {boolean} silent - エラーや成功メッセージをトースト表示しないか
+ */
+async function syncNow(silent = false) {
+    const clientId = storage.getSetting('googleClientId');
+    const driveStatus = await driveGetStatus();
+
+    if (!clientId || !driveStatus.signedIn || !navigator.onLine) {
+        if (!silent) {
+            if (!clientId) toast('GoogleクライアントIDが設定されていません。');
+            else if (!driveStatus.signedIn) toast('Googleドライブにログインしていません。');
+            else if (!navigator.onLine) toast('オフラインのため同期できません。');
+        }
+        return;
+    }
+
+    try {
+        const result = await syncController.sync({ force: !silent });
+        await updateDriveStatus(); // 同期結果をUIに反映
+
+        if (result.status === 'error') {
+            if (!silent) toast('同期に失敗しました: ' + result.reason);
+        } else if (!silent && (result.status === 'merged' || result.status === 'uploaded')) {
+            toast('Googleドライブと同期しました。');
+        }
+        // 成功時は renderHistory() が onApplied で呼ばれる
+    } catch (error) {
+        console.error('syncNowエラー:', error);
+        if (!silent) toast('同期中に予期せぬエラーが発生しました。');
+        await updateDriveStatus();
+    }
+}
+
+/**
+ * 自動同期を実行する（エラーは握りつぶす）
+ */
+function autoSync() {
+    syncNow(true).catch(() => {}); // エラーはコンソールに出るが、UIには表示しない
 }
 
 /**

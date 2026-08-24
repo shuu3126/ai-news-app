@@ -214,6 +214,7 @@ export function splitIntoChunks(text, maxLen = 120) {
  * @param {string} [options.voiceURI] - 使用する音声の voiceURI。
  * @param {number} [options.rate=1.0] - 読み上げ速度 (0.5〜2.0)。
  * @param {number} [options.pitch=1.0] - 読み上げピッチ (0〜2)。
+ * @param {number} [options.volume=1.0] - 音量 (0.0〜1.0)。
  * @param {function(number, number, string): void} [options.onChunk] - 各チャンクの再生開始時に呼ばれるコールバック (index, total, chunkText)。
  * @param {function(): void} [options.onEnd] - 全ての読み上げが終了した時に呼ばれるコールバック。
  * @param {function(Error): void} [options.onError] - エラー発生時に呼ばれるコールバック。
@@ -246,6 +247,7 @@ export function speak(text, options = {}) {
     voiceURI: options.voiceURI || '',
     rate: Math.max(0.5, Math.min(2.0, options.rate ?? 1.0)),
     pitch: Math.max(0, Math.min(2, options.pitch ?? 1.0)),
+    volume: Math.max(0, Math.min(1, options.volume ?? 1.0)),
     onChunk: options.onChunk,
     onEnd: options.onEnd,
     onError: options.onError
@@ -284,6 +286,7 @@ function _startNextChunk(session) {
   utterance.lang = 'ja-JP';
   utterance.rate = _options.rate;
   utterance.pitch = _options.pitch;
+  utterance.volume = _options.volume;
   // 音声リストは speak() 開始前にキャッシュ済み。ここで await すると
   // チャンクの繋ぎ目に無音の隙間ができるので同期的に選ぶ。
   utterance.voice = pickDefaultVoice(_cachedVoices, _options.voiceURI);

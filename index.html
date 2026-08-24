@@ -19,26 +19,41 @@
         <main>
             <!-- ===== メイン ===== -->
             <section id="view-main" class="view">
-                <button id="btn-generate" class="primary-btn big-btn">本日のダイジェストを生成</button>
-                <div id="generate-status" class="status-message" hidden>
-                    <span class="spinner"></span> <span class="message-text"></span>
-                </div>
-                <button id="btn-cancel-generate" class="secondary-btn" hidden>生成を中止</button>
-
-                <div id="digest-panel" class="digest-panel" hidden>
-                    <div id="digest-meta" class="digest-meta"></div>
-                    <div class="speak-controls">
-                        <button id="btn-speak" class="primary-btn">読み上げる</button>
-                        <button id="btn-pause" class="secondary-btn" hidden>一時停止</button>
-                        <button id="btn-stop" class="secondary-btn" hidden>停止</button>
+                <div class="main-primary">
+                    <button id="btn-generate" class="primary-btn big-btn">本日のダイジェストを生成</button>
+                    <div id="generate-status" class="status-message" hidden>
+                        <span class="spinner"></span> <span class="message-text"></span>
                     </div>
-                    <div id="speak-progress" class="speak-progress" hidden></div>
-                    <p id="speech-note" class="note">
-                        読み上げはブラウザの音声合成機能を使っています。他のタブへ移動したり画面がスリープしたりすると、
-                        途中で止まることがあります。止まった場合は「読み上げる」をもう一度押してください。
+                    <button id="btn-cancel-generate" class="secondary-btn" hidden>生成を中止</button>
+
+                    <p id="main-empty" class="empty-hint">
+                        まだ今日のダイジェストがありません。上のボタンを押すと、最新のAI活用ニュースを集めて約15分の原稿を作ります。生成には1〜3分かかります。
                     </p>
-                    <div id="digest-text" class="digest-text"></div>
+
+                    <div id="digest-panel" class="digest-panel" hidden>
+                        <div id="digest-meta" class="digest-meta"></div>
+                        <div class="speak-controls">
+                            <button id="btn-speak" class="primary-btn">読み上げる</button>
+                            <button id="btn-pause" class="secondary-btn" hidden>一時停止</button>
+                            <button id="btn-stop" class="secondary-btn" hidden>停止</button>
+                        </div>
+                        <div id="speak-progress" class="speak-progress" hidden></div>
+                        <div id="speak-equalizer" class="equalizer" hidden aria-hidden="true">
+                            <span class="eq-bar"></span><span class="eq-bar"></span><span class="eq-bar"></span><span class="eq-bar"></span><span class="eq-bar"></span>
+                        </div>
+                        <p id="speech-note" class="note">
+                            読み上げはブラウザの音声合成機能を使っています。他のタブへ移動したり画面がスリープしたりすると、
+                            途中で止まることがあります。止まった場合は「読み上げる」をもう一度押してください。
+                        </p>
+                        <div id="digest-text" class="digest-text"></div>
+                    </div>
                 </div>
+
+                <aside id="recent-rail" class="recent-rail">
+                    <h2 class="rail-title">最近のダイジェスト</h2>
+                    <p id="recent-rail-empty" class="rail-empty">まだダイジェストがありません。</p>
+                    <ul id="recent-rail-list" class="rail-list"></ul>
+                </aside>
             </section>
 
             <!-- ===== 履歴 ===== -->
@@ -74,6 +89,8 @@
                     <select id="voice-select"></select>
                     <label for="rate-range">速度 <span id="rate-value">1.0</span></label>
                     <input type="range" id="rate-range" min="0.5" max="2.0" step="0.1" value="1.0">
+                    <label for="volume-range">音量 <span id="volume-value">100%</span></label>
+                    <input type="range" id="volume-range" min="0" max="1" step="0.05" value="1">
                     <div class="settings-actions">
                         <button id="btn-test-speak" class="secondary-btn">テスト再生</button>
                     </div>
@@ -87,12 +104,45 @@
                 </div>
 
                 <div class="settings-group">
+                    <h3>表示</h3>
+                    <label for="theme-select">テーマ</label>
+                    <select id="theme-select">
+                        <option value="auto">端末の設定に合わせる</option>
+                        <option value="light">ライト</option>
+                        <option value="dark">ダーク</option>
+                    </select>
+                </div>
+
+                <div class="settings-group">
                     <h3>モデル</h3>
                     <label for="model-select">Geminiモデル</label>
                     <select id="model-select">
                         <option value="gemini-2.5-flash">gemini-2.5-flash（推奨・速い）</option>
                         <option value="gemini-2.5-pro">gemini-2.5-pro（高品質・遅い）</option>
                     </select>
+                </div>
+
+                <div id="drive-section" class="settings-group">
+                    <h3>Googleドライブ同期</h3>
+                    <p class="note">ダイジェストの履歴をGoogleドライブに保存します。スマホで作ってもパソコンで作っても、同じ履歴が両方に出るようになります。</p>
+                    <p class="note">アクセス権限は「このアプリが作ったファイルだけ」に限定されています（drive.fileスコープ）。ドライブ内の他のファイルは読み取りません。</p>
+
+                    <label for="google-client-id">GoogleクライアントID</label>
+                    <input type="password" id="google-client-id" placeholder="xxxxx.apps.googleusercontent.com" autocomplete="off">
+                    <div class="settings-actions">
+                        <button id="btn-save-client-id" class="secondary-btn">保存</button>
+                    </div>
+
+                    <div id="drive-status" class="status-message">未設定</div>
+
+                    <div class="settings-actions">
+                        <button id="btn-drive-signin" class="primary-btn">Googleでログイン</button>
+                        <button id="btn-sync-now" class="secondary-btn" hidden>今すぐ同期</button>
+                        <button id="btn-drive-signout" class="ghost-btn" hidden>ログアウト</button>
+                    </div>
+
+                    <p class="note">保存先: マイドライブ内の ai-news-app-data / ai-news-data.json<br>
+                    このフォルダはドライブ上で自由に移動できます（移動してもIDで追跡するため同期は切れません）。</p>
                 </div>
 
                 <div id="settings-status" class="status-message" hidden></div>

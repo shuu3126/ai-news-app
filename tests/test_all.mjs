@@ -41,6 +41,7 @@ await page.evaluateOnNewDocument(() => {
       this.lang = '';
       this.rate = 1;
       this.pitch = 1;
+      this.volume = 1;
       this.voice = null;
       this.onstart = null;
       this.onend = null;
@@ -663,6 +664,458 @@ ok('manifest.webmanifest の icons が2件以上ある', manifest.icons && manif
 
 const swResponse = await page.goto(`${URL}sw.js`, { waitUntil: 'domcontentloaded' });
 eq('sw.js が 200 で取得できる', swResponse.status(), 200);
+
+// [12] 音量調整
+console.log('\n[12] 音量調整');
+// 直前の [11] で sw.js へ遷移しているので、必ずアプリへ戻してから localStorage を触る
+await reload();
+await clearAll();
+await click('.nav-btn[data-view="settings"]');
+
+eq('#volume-range の初期値が 1', await prop('#volume-range', 'value'), '1');
+eq('#volume-value の初期表示が 100%', await text('#volume-value'), '100%');
+
+await setValue('#volume-range', '0.4');
+await wait(50);
+const settingsAfterVolume = await page.evaluate(() => JSON.parse(localStorage.getItem('ainews.settings.v1')));
+eq('音量が localStorage に保存される', settingsAfterVolume.volume, 0.4);
+eq('#volume-value の表示が 40% になる', await text('#volume-value'), '40%');
+
+await reload();
+await click('.nav-btn[data-view="settings"]');
+eq('リロード後も音量スライダーが復元される', await prop('#volume-range', 'value'), '0.4');
+eq('リロード後も音量表示が復元される', await text('#volume-value'), '40%');
+
+// テスト再生に volume が渡っているか（speechSynthesis のモックが utterance を記録している）
+await page.evaluate(() => { window.__spoken = []; window.__lastUtterance = null; });
+await click('#btn-test-speak');
+await wait(80);
+const testSpeakUtterance = await page.evaluate(() => ({
+  volume: window.__lastUtterance?.volume,
+  rate: window.__lastUtterance?.rate
+}));
+eq('テスト再生の utterance に設定した音量が渡る', testSpeakUtterance.volume, 0.4);
+eq('音量を変えても速度は既定のまま', testSpeakUtterance.rate, 1);
+
+// 範囲外の値は storage 側でクランプされる
+const clampedVolume = await page.evaluate(async () => {
+  const s = await import('./js/storage.js');
+  s.setSetting('volume', 5);
+  return s.getSetting('volume');
+});
+eq('範囲外の音量は 1.0 にクランプされる', clampedVolume, 1);
+
+// [13] テーマの手動切り替え
+console.log('\n[13] テーマの手動切り替え');
+await clearAll();
+await click('.nav-btn[data-view="settings"]');
+
+eq('#theme-select の初期値が auto', await prop('#theme-select', 'value'), 'auto');
+eq('auto のとき body に data-theme が付いていない',
+  await page.evaluate(() => document.body.dataset.theme), undefined);
+
+await setValue('#theme-select', 'dark');
+await wait(50);
+eq('dark を選ぶと body[data-theme=dark] になる',
+  await page.evaluate(() => document.body.dataset.theme), 'dark');
+
+await reload();
+eq('リロード後も dark が保たれる',
+  await page.evaluate(() => document.body.dataset.theme), 'dark');
+
+await click('.nav-btn[data-view="settings"]');
+await setValue('#theme-select', 'auto');
+await wait(50);
+eq('auto に戻すと data-theme 属性そのものが外れる（@media を効かせるため）',
+  await page.evaluate(() => document.body.dataset.theme), undefined);
+ok('auto に戻したとき data-theme 属性が空文字で残っていない',
+  await page.evaluate(() => !document.body.hasAttribute('data-theme')));
+
+// --- ダークモードの生成中バナーが白く浮かないこと（カスケード順の回帰テスト） ---
+// ダーク用の上書きをCSS冒頭の @media に書くと、後ろに出てくる同一詳細度の
+// ライト用ルールに打ち消される。実際に一度それで壊れたので、色を実測して守る。
+const parseRgb = (s) => (s.match(/[\d.]+/g) || []).map(Number);
+
+// (a) OS設定がダークのとき（@media (prefers-color-scheme: dark)）
+await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'dark' }]);
+await reload();
+const osDarkColors = await page.evaluate(() => {
+  const s = document.querySelector('#generate-status');
+  s.hidden = false; s.className = 'status-message status-loading';
+  const bg = getComputedStyle(s).backgroundColor;
+  const panelBorder = getComputedStyle(document.querySelector('#digest-panel')).borderTopWidth;
+  s.hidden = true;
+  return { bg, panelBorder, bodyBg: getComputedStyle(document.body).backgroundColor };
+});
+ok('OSダーク時に body の背景が暗い', parseRgb(osDarkColors.bodyBg)[0] < 60);
+ok('OSダーク時の生成中バナーがライト固定色(#e0eaf2)のままになっていない',
+  parseRgb(osDarkColors.bg)[0] < 120);
+ok('OSダーク時はカードに枠線が出る（影が見えないため）',
+  parseFloat(osDarkColors.panelBorder) >= 1);
+
+// (b) 手動でダークを選んだとき（body[data-theme="dark"]）
+await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'light' }]);
+await reload();
+const manualDarkColors = await page.evaluate(async () => {
+  const s = await import('./js/storage.js');
+  s.setSetting('theme', 'dark');
+  document.body.dataset.theme = 'dark';
+  const el = document.querySelector('#generate-status');
+  el.hidden = false; el.className = 'status-message status-loading';
+  const bg = getComputedStyle(el).backgroundColor;
+  const panelBorder = getComputedStyle(document.querySelector('#digest-panel')).borderTopWidth;
+  el.hidden = true;
+  return { bg, panelBorder };
+});
+ok('手動ダーク時も生成中バナーが白く浮かない', parseRgb(manualDarkColors.bg)[0] < 120);
+ok('手動ダーク時もカードに枠線が出る', parseFloat(manualDarkColors.panelBorder) >= 1);
+
+// (c) OSがダークでも手動でライトを選んだらライトの見た目になる
+const manualLightColors = await page.evaluate(async () => {
+  const s = await import('./js/storage.js');
+  s.setSetting('theme', 'light');
+  document.body.dataset.theme = 'light';
+  const el = document.querySelector('#generate-status');
+  el.hidden = false; el.className = 'status-message status-loading';
+  const bg = getComputedStyle(el).backgroundColor;
+  el.hidden = true;
+  return { bg, bodyBg: getComputedStyle(document.body).backgroundColor };
+});
+ok('手動ライト時はバナーが明るい色に戻る', parseRgb(manualLightColors.bg)[0] > 180);
+ok('手動ライト時は body の背景が明るい', parseRgb(manualLightColors.bodyBg)[0] > 200);
+
+// 以降のテストの前提を崩さないよう、テーマ設定を戻す
+await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: 'light' }]);
+await clearAll();
+
+// [14] 読み上げ波形（イコライザー）
+console.log('\n[14] 読み上げ波形（イコライザー）');
+await clearAll();
+await page.evaluate((key) => {
+  localStorage.setItem('ainews.settings.v1', JSON.stringify({ geminiApiKey: key, autoPlay: false }));
+}, 'AQ.test-dummy-key-for-automated-tests');
+await reload();
+
+await page.evaluate(() => {
+  // モックの読み上げは1チャンク約20msで終わる。短い本文だと
+  // 「読み上げ中」の瞬間を観測する前に onEnd が走って UI が戻ってしまうので、
+  // チャンク数を稼げるだけの長さを持たせる（60文 ≒ 20チャンク ≒ 400ms）
+  const longText = 'これは読み上げ波形の表示を確認するための、十分に長さのあるテスト用の文章です。'.repeat(60);
+  const digest = {
+    id: 'eq-test', date: '2026-08-25',
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), deletedAt: '',
+    text: longText, charCount: longText.length
+  };
+  localStorage.setItem('ainews.digests.v1', JSON.stringify([digest]));
+});
+await reload();
+await click('.nav-btn[data-view="history"]');
+await click('.history-item .btn-open[data-id="eq-test"]');
+await wait(200);
+
+eq('#speak-equalizer が5本の .eq-bar を持つ',
+  await page.$$eval('#speak-equalizer .eq-bar', els => els.length), 5);
+ok('読み上げ前は #speak-equalizer が hidden', await hidden('#speak-equalizer'));
+
+await click('#btn-speak');
+await wait(150);
+ok('読み上げ中は #speak-equalizer が表示される', !(await hidden('#speak-equalizer')));
+ok('読み上げ中は is-paused が付いていない',
+  !(await page.$eval('#speak-equalizer', e => e.classList.contains('is-paused'))));
+
+await click('#btn-pause');
+await wait(100);
+ok('一時停止すると .is-paused が付く',
+  await page.$eval('#speak-equalizer', e => e.classList.contains('is-paused')));
+
+await click('#btn-pause'); // 再開
+await wait(100);
+ok('再開すると .is-paused が外れる',
+  !(await page.$eval('#speak-equalizer', e => e.classList.contains('is-paused'))));
+
+await click('#btn-stop');
+await wait(100);
+ok('停止すると #speak-equalizer が hidden に戻る', await hidden('#speak-equalizer'));
+ok('停止時に .is-paused も外れている',
+  !(await page.$eval('#speak-equalizer', e => e.classList.contains('is-paused'))));
+
+// [15] 空状態の案内・履歴の相対日付・声の表示名
+console.log('\n[15] 空状態・相対日付・声の表示名');
+await clearAll();
+ok('ダイジェストが無いとき #main-empty が表示される', !(await hidden('#main-empty')));
+ok('ダイジェストが無いとき #digest-panel は hidden', await hidden('#digest-panel'));
+
+// 今日 / 昨日 / 3日前 のダイジェストを入れて相対表記を確認
+await page.evaluate(() => {
+  const pad = (n) => String(n).padStart(2, '0');
+  const dstr = (offsetDays) => {
+    const d = new Date();
+    d.setDate(d.getDate() - offsetDays);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  };
+  const mk = (id, offsetDays) => ({
+    id, date: dstr(offsetDays),
+    createdAt: new Date(Date.now() - offsetDays * 86400000).toISOString(),
+    updatedAt: new Date(Date.now() - offsetDays * 86400000).toISOString(),
+    deletedAt: '',
+    text: `${id} の本文です。テスト用のダミーです。`, charCount: 20
+  });
+  localStorage.setItem('ainews.digests.v1', JSON.stringify([mk('d-today', 0), mk('d-yesterday', 1), mk('d-3days', 3)]));
+});
+await reload();
+await click('.nav-btn[data-view="history"]');
+await wait(100);
+
+const historyDates = await page.$$eval('.history-item .history-date', els => els.map(e => e.textContent));
+ok('履歴の日付に「今日」が出る', historyDates.some(t => t.startsWith('今日')));
+ok('履歴の日付に「昨日」が出る', historyDates.some(t => t.startsWith('昨日')));
+ok('履歴の日付に「3日前」が出る', historyDates.some(t => t.startsWith('3日前')));
+ok('相対表記の後ろに YYYY-MM-DD も併記されている', historyDates.every(t => /\d{4}-\d{2}-\d{2}/.test(t)));
+
+// ボタンの強弱（開く＝primary / 削除＝ghost）
+ok('「開く」が primary-btn になっている',
+  await page.$eval('.history-item .btn-open', e => e.classList.contains('primary-btn')));
+ok('「削除」が ghost-btn になっている（danger-btn ではない）',
+  await page.$eval('.history-item .btn-delete', e => e.classList.contains('ghost-btn') && !e.classList.contains('danger-btn')));
+
+// 声の表示名の整形
+const voiceLabels = await page.$$eval('#voice-select option', els => els.map(e => ({ t: e.textContent, title: e.title, v: e.value })));
+ok('声のオプションに内部名そのままの " - Japanese (Japan)" が出ていない',
+  voiceLabels.every(o => !o.t.includes(' - Japanese (Japan)')));
+ok('日本語の声のラベルが「（日本語）」で終わる（ロケール表記のままにしない）',
+  voiceLabels.filter(o => o.v === 'mock-ja').every(o => o.t.endsWith('（日本語）')));
+ok('英語の声のラベルが「（英語）」で終わる',
+  voiceLabels.filter(o => o.v === 'mock-en').every(o => o.t.endsWith('（英語）')));
+ok('声のオプションの value は voiceURI のまま（自動以外）',
+  voiceLabels.filter(o => o.v !== '').every(o => typeof o.v === 'string' && o.v.length > 0));
+ok('整形前の内部名は title 属性に残っている',
+  voiceLabels.filter(o => o.v !== '').every(o => o.title && o.title.length > 0));
+
+// [16] 論理削除と同期マージ
+console.log('\n[16] 論理削除と同期マージ');
+await clearAll();
+await page.evaluate(() => {
+  const now = new Date().toISOString();
+  localStorage.setItem('ainews.digests.v1', JSON.stringify([
+    { id: 'a', date: '2026-08-20', createdAt: now, updatedAt: now, deletedAt: '', text: 'Aの本文です。', charCount: 7 },
+    { id: 'b', date: '2026-08-19', createdAt: now, updatedAt: now, deletedAt: '', text: 'Bの本文です。', charCount: 7 }
+  ]));
+});
+await reload();
+
+const afterLogicalDelete = await page.evaluate(async () => {
+  const s = await import('./js/storage.js');
+  s.deleteDigest('a');
+  return {
+    live: s.loadDigests().map(d => d.id),
+    all: s.loadAllDigests().map(d => ({ id: d.id, deleted: !!d.deletedAt }))
+  };
+});
+ok('削除したレコードは loadDigests() から消える', !afterLogicalDelete.live.includes('a'));
+ok('削除したレコードは loadAllDigests() に墓標として残る',
+  afterLogicalDelete.all.some(d => d.id === 'a' && d.deleted));
+
+const afterClearAllDigests = await page.evaluate(async () => {
+  const s = await import('./js/storage.js');
+  s.clearDigests();
+  return { live: s.loadDigests().length, all: s.loadAllDigests().length };
+});
+eq('clearDigests() で生きたレコードが0件になる', afterClearAllDigests.live, 0);
+ok('clearDigests() は物理削除しない（墓標が残る）', afterClearAllDigests.all >= 2);
+
+// mergeRecords の LWW と削除優先
+const mergeResult = await page.evaluate(async () => {
+  const { mergeRecords, toTime } = await import('./js/sync.js');
+  const older = { id: 'x', updatedAt: '2026-08-20T00:00:00.000Z', deletedAt: '', text: '古い' };
+  const newer = { id: 'x', updatedAt: '2026-08-21T00:00:00.000Z', deletedAt: '', text: '新しい' };
+  const lww = mergeRecords([older], [newer]);
+
+  // 文字列比較だと "...+09:00" < "...Z" で誤判定する組み合わせ
+  const localFmt = { id: 'y', updatedAt: '2026-08-21T09:00:00+09:00', text: 'ローカル表記' };
+  const utcFmt = { id: 'y', updatedAt: '2026-08-21T00:00:00.000Z', text: 'UTC表記' };
+
+  // 同着なら削除を優先する
+  const t = '2026-08-22T00:00:00.000Z';
+  const alive = { id: 'z', updatedAt: t, deletedAt: '', text: '生存' };
+  const dead = { id: 'z', updatedAt: t, deletedAt: t, text: '削除済み' };
+  const tie = mergeRecords([alive], [dead]);
+
+  return {
+    lwwText: lww.merged[0].text,
+    lwwFromRemote: lww.fromRemote,
+    sameInstant: toTime(localFmt.updatedAt) === toTime(utcFmt.updatedAt),
+    tieDeleted: !!tie.merged[0].deletedAt,
+    onlyLocal: mergeRecords([older], []).merged.length,
+    onlyRemote: mergeRecords([], [newer]).merged.length
+  };
+});
+eq('mergeRecords が新しい方（リモート）を採用する', mergeResult.lwwText, '新しい');
+eq('リモート由来の取り込み件数が1', mergeResult.lwwFromRemote, 1);
+ok('toTime() は "+09:00" と "Z" を同じ時刻として扱う（文字列比較していない）', mergeResult.sameInstant);
+ok('時刻が同着なら削除を優先する', mergeResult.tieDeleted);
+eq('リモートが空でもローカルは残る', mergeResult.onlyLocal, 1);
+eq('ローカルが空ならリモートを取り込む', mergeResult.onlyRemote, 1);
+
+// buildSyncPayload は墓標込みで詰める（削除が他端末へ伝わらないと復活する）
+const payloadShape = await page.evaluate(async () => {
+  const { buildSyncPayload, normalizePayloadShape } = await import('./js/sync.js');
+  const p = buildSyncPayload();
+  return {
+    app: p.app,
+    hasDigests: Array.isArray(p.digests),
+    includesTombstone: p.digests.some(d => !!d.deletedAt),
+    fromBareArray: normalizePayloadShape([{ id: 'q' }]).digests.length,
+    fromGarbage: normalizePayloadShape(null).digests.length
+  };
+});
+eq('ペイロードの app 名が ai-news-app', payloadShape.app, 'ai-news-app');
+ok('ペイロードに digests 配列がある', payloadShape.hasDigests);
+ok('ペイロードに墓標が含まれている', payloadShape.includesTombstone);
+eq('素の配列も digests として受け取れる', payloadShape.fromBareArray, 1);
+eq('壊れたペイロードでも落ちない', payloadShape.fromGarbage, 0);
+
+// sync() は download() の完了後にローカルを読む（待っている間の保存を消さない）
+const syncOrder = await page.evaluate(async () => {
+  const { initSync } = await import('./js/sync.js');
+  const s = await import('./js/storage.js');
+  s.replaceAllDigests([]);
+
+  let uploaded = null;
+  const controller = initSync({
+    getStatus: () => ({ configured: true, signedIn: true }),
+    isOnline: () => true,
+    // download の待ち時間中に「別画面で保存された」状況を作る
+    download: () => new Promise((resolve) => setTimeout(() => {
+      s.saveDigest({ date: '2026-08-23', text: 'ダウンロード待ちの間に保存された本文です。' });
+      resolve({ digests: [] });
+    }, 30)),
+    upload: (payload) => { uploaded = payload; return Promise.resolve(); }
+  });
+  const result = await controller.sync({ force: true });
+  return {
+    status: result.status,
+    survived: s.loadDigests().some(d => d.text.includes('ダウンロード待ちの間に保存された')),
+    uploadedCount: uploaded ? uploaded.digests.length : -1
+  };
+});
+ok('ダウンロード待ちの間に保存されたデータが同期で消えない', syncOrder.survived);
+ok('その分がアップロードにも載る', syncOrder.uploadedCount >= 1);
+
+// 同期状態のUI
+await clearAll();
+await click('.nav-btn[data-view="settings"]');
+ok('#drive-section が設定画面にある', await exists('#drive-section'));
+ok('未設定のとき #drive-status に「未設定」と出る', (await text('#drive-status')).includes('未設定'));
+ok('未設定のときは「今すぐ同期」が hidden', await hidden('#btn-sync-now'));
+ok('未設定のときは「ログアウト」が hidden', await hidden('#btn-drive-signout'));
+eq('#google-client-id の type が password', await attr('#google-client-id', 'type'), 'password');
+
+await setValue('#google-client-id', '1234567890-abcdef.apps.googleusercontent.com');
+await click('#btn-save-client-id');
+await wait(150);
+const settingsAfterClientId = await page.evaluate(() => JSON.parse(localStorage.getItem('ainews.settings.v1')));
+eq('クライアントIDが localStorage に保存される',
+  settingsAfterClientId.googleClientId, '1234567890-abcdef.apps.googleusercontent.com');
+eq('保存後は入力欄に実値を残さない', await prop('#google-client-id', 'value'), '');
+ok('保存後は「未ログイン」表示になり、ログインボタンが出る',
+  (await text('#drive-status')).includes('未ログイン') && !(await hidden('#btn-drive-signin')));
+
+// [17] PC幅レイアウト（最後にまとめて実施し、必ずモバイル解像度へ戻す）
+console.log('\n[17] PC幅レイアウト');
+await clearAll();
+await page.evaluate(() => {
+  const now = new Date().toISOString();
+  localStorage.setItem('ainews.digests.v1', JSON.stringify([
+    { id: 'r1', date: '2026-08-24', createdAt: now, updatedAt: now, deletedAt: '', text: 'レール1の本文です。', charCount: 10 },
+    { id: 'r2', date: '2026-08-23', createdAt: now, updatedAt: now, deletedAt: '', text: 'レール2の本文です。', charCount: 10 }
+  ]));
+});
+
+// --- モバイル幅（420px）での前提確認 ---
+await reload();
+const railDisplayMobile = await page.$eval('#recent-rail', e => getComputedStyle(e).display);
+eq('モバイル幅では右レールが display:none', railDisplayMobile, 'none');
+const navPositionMobile = await page.$eval('.bottom-nav', e => getComputedStyle(e).position);
+eq('モバイル幅では下部ナビが fixed', navPositionMobile, 'fixed');
+
+// --- PC幅（1280x800）へ ---
+await page.setViewport({ width: 1280, height: 800 });
+await reload();
+
+const pcLayout = await page.evaluate(() => {
+  const app = document.querySelector('#app');
+  const nav = document.querySelector('.bottom-nav');
+  const rail = document.querySelector('#recent-rail');
+  const viewMain = document.querySelector('#view-main');
+  return {
+    appDisplay: getComputedStyle(app).display,
+    navPosition: getComputedStyle(nav).position,
+    navBottom: getComputedStyle(nav).bottom,
+    railDisplay: getComputedStyle(rail).display,
+    viewMainDisplay: getComputedStyle(viewMain).display,
+    railLeft: rail.getBoundingClientRect().left,
+    navRight: nav.getBoundingClientRect().right,
+    mainLeft: document.querySelector('main').getBoundingClientRect().left
+  };
+});
+eq('PC幅では #app が grid になる', pcLayout.appDisplay, 'grid');
+eq('PC幅では下部ナビが sticky（サイドナビ）になる', pcLayout.navPosition, 'sticky');
+eq('PC幅では bottom が auto に戻っている（画面下に貼り付かない）', pcLayout.navBottom, 'auto');
+eq('PC幅では右レールが表示される', pcLayout.railDisplay, 'block');
+eq('PC幅では #view-main が grid（本文＋右レールの2カラム）', pcLayout.viewMainDisplay, 'grid');
+ok('サイドナビがメインより左にある', pcLayout.navRight <= pcLayout.mainLeft + 1);
+ok('右レールが画面右側に配置されている', pcLayout.railLeft > 640);
+
+// 右レールの中身とクリック
+const railItems = await page.$$eval('#recent-rail .rail-item-btn', els => els.map(e => e.dataset.id));
+eq('右レールに履歴が2件並ぶ', railItems.length, 2);
+ok('右レールの空メッセージが hidden', await hidden('#recent-rail-empty'));
+
+await click('#recent-rail .rail-item-btn[data-id="r2"]');
+await wait(200);
+ok('右レールから開くと本文が #digest-text に入る', (await text('#digest-text')).includes('レール2の本文'));
+ok('開いた項目に .is-current が付く',
+  await page.$eval('#recent-rail .rail-item-btn[data-id="r2"]', e => e.classList.contains('is-current')));
+ok('PC幅でもビュー切り替え（hidden）が壊れていない', await hidden('#view-settings'));
+
+await click('.nav-btn[data-view="settings"]');
+await wait(100);
+ok('PC幅でも設定ビューへ切り替えできる', !(await hidden('#view-settings')));
+ok('PC幅でメインビューは hidden になる', await hidden('#view-main'));
+
+// 1100px以上では設定が2カラム
+const settingsDisplay = await page.$eval('#view-settings', e => getComputedStyle(e).display);
+eq('1100px以上で設定ビューが2カラム grid になる', settingsDisplay, 'grid');
+
+// 生成ボタンのシマークラス（クラスの付け外しだけ確認）
+await click('.nav-btn[data-view="main"]');
+const shimmerToggles = await page.evaluate(() => {
+  const btn = document.querySelector('#btn-generate');
+  btn.classList.add('is-generating');
+  const on = getComputedStyle(btn).backgroundImage !== 'none';
+  btn.classList.remove('is-generating');
+  const off = getComputedStyle(btn).backgroundImage === 'none';
+  return { on, off };
+});
+ok('.is-generating が付くとシマー用の background-image が入る', shimmerToggles.on);
+ok('.is-generating を外すと background-image が消える', shimmerToggles.off);
+
+// 波形のバーがPC幅で高さを持っている（scaleY だけで height が無いと見えなくなる）
+const eqBarBox = await page.evaluate(() => {
+  const eq = document.querySelector('#speak-equalizer');
+  eq.hidden = false;
+  const bar = eq.querySelector('.eq-bar');
+  const r = bar.getBoundingClientRect();
+  const out = { h: r.height, w: r.width };
+  eq.hidden = true;
+  return out;
+});
+ok('波形のバーに高さがある（height 未指定で潰れていない）', eqBarBox.h > 5);
+ok('PC幅では波形のバーが太くなる（7px）', eqBarBox.w >= 6);
+
+// **必ずモバイル解像度へ戻す**（戻さないと後続の前提が崩れる）
+await page.setViewport({ width: 420, height: 900 });
+await reload();
 
 
 console.log(`\n==== 結果: ${pass} PASS / ${fail} FAIL ====`);

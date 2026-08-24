@@ -1,6 +1,6 @@
 // キャッシュ名を変えると古いキャッシュが activate 時に破棄される。
 // アプリを更新したらここのバージョンを上げること。
-const CACHE_NAME = 'ainews-v1';
+const CACHE_NAME = 'ainews-v2';
 const APP_SHELL_URLS = [
     './',
     './index.html',
@@ -9,6 +9,8 @@ const APP_SHELL_URLS = [
     './js/storage.js',
     './js/gemini.js',
     './js/speech.js',
+    './js/sync.js',
+    './js/drivesync.js',
     './manifest.webmanifest',
     './icons/icon-192.png',
     './icons/icon-512.png',
