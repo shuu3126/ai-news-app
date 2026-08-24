@@ -1,0 +1,25 @@
+# ===== 秘密情報（APIキーは絶対にコミットしない） =====
+.env
+.env.*
+config.local.js
+*apikey*
+*api-key*
+secrets.json
+
+# ===== 生成物・ローカル作業ファイル =====
+digests/
+*.digest.txt
+node_modules/
+package-lock.json
+package.json
+
+# ===== OS / エディタ =====
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# ===== Google Drive の同期残骸 =====
+*.tmp
+~$*

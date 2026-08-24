@@ -1,0 +1,58 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: APIキーが混入していないか検査
+        run: |
+          # Google APIキー（従来形式 AIza... / 新形式 AQ....）がソースに含まれていないか。
+          # テスト用のダミーキーだけは除外する（本物を誤って貼ると "dummy" は入らないので、
+          # 誤検知を消しつつ実害のある混入は止められる）。
+          INCLUDES="--include=*.js --include=*.html --include=*.json --include=*.webmanifest --include=*.md"
+          if grep -rEn $INCLUDES 'AIza[0-9A-Za-z_-]{30,}' . | grep -vi 'dummy' ; then
+            echo "::error::APIキーらしき文字列（AIza形式）がソースに含まれています。"
+            exit 1
+          fi
+          if grep -rEn $INCLUDES 'AQ\.[0-9A-Za-z_-]{20,}' . | grep -vi 'dummy' ; then
+            echo "::error::APIキーらしき文字列（AQ.形式）がソースに含まれています。"
+            exit 1
+          fi
+          # x-goog-api-key に literal を直書きしていないか（変数参照ならOK）
+          if grep -rEn "'x-goog-api-key'\s*:\s*'" --include='*.js' . ; then
+            echo "::error::x-goog-api-key に文字列リテラルが直書きされています。"
+            exit 1
+          fi
+          echo "検査OK"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
